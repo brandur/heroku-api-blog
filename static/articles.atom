@@ -1,0 +1,236 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xml:lang="en-US" xmlns="http://www.w3.org/2005/Atom">
+  <title>Heroku API Development Blog</title>
+  <id>tag:brandur.github.io/heroku-api-blog,2012:/articles</id>
+  <updated>2013-05-23T19:16:28+00:00</updated>
+  <link rel="alternate" type="text/html" href="https://brandur.github.io/heroku-api-blog"/>
+  <link rel="self" type="application/atom+xml" href="https://brandur.github.io/heroku-api-blog/articles.atom"/>
+  <entry>
+    <title>SOA and Service Stubs</title>
+    <content type="html">&lt;p&gt;&lt;a href="http://en.wikipedia.org/wiki/Service-oriented_architecture"&gt;Service-oriented architecture&lt;/a&gt; (SOA) is a popular technique at a number of software development shops these days, each trying to avoid the age-old problem of the monolithic codebase. This includes us at Heroku, where the underlying kernel that supports the Heroku platform is fundamentally decomposed into a number of backend services, each of which having a well-defined set of responsibilities, and a team to operate it.&lt;/p&gt;
+
+&lt;p&gt;Despite us being happily well-invested in this architectural approach, SOA has a number of downsides, one of the foremost being that running a single application in isolation becomes difficult because it relies on so many external services.&lt;/p&gt;
+
+&lt;p&gt;A traditional solution for us has been to stub these services at a high-level to avoid making remote calls during development and testing. Here are some real examples from our codebase of what these service stubs looked like:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-ruby"&gt;# Logplex stub
+Logplex.stub(:create_token)
+
+# Addons stub
+Addons::Client.mock! if ENV[&amp;quot;RACK_ENV&amp;quot;] == &amp;quot;test&amp;quot;
+
+# Domain management service stub
+Maestro::ResourceHandler.mock!
+
+# Billing management service stub
+def detect_handler
+  return RealHandler.new if ENV.has_key?(&amp;quot;CORE_SHUSHU_URL&amp;quot;)
+  MockHandler.new
+end
+
+# Process management service stub
+return ServiceApi::MockHandler.new(&amp;quot;https://psmgr.heroku-#{name}.com&amp;quot;) unless psmgr_url
+
+# Resource provisioning
+def api_calls_enabled?
+  Utils.in_cloud? || RAILS_ENV == &amp;#39;test&amp;#39; || ENV[&amp;#39;API_CALLS_ENABLED&amp;#39;] # OMG HACK
+end
+response = handler.install(app, user, options) if api_calls_enabled?
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;h2&gt;Progression&lt;/h2&gt;
+
+&lt;p&gt;Implementations varied as more services were added over time, and generally became more sophisticated as we learned the downsides of particular approaches and iterated on them. This progression eventually led to the &lt;em&gt;Rack service stubs&lt;/em&gt; we use today, and which are detailed in the next section.&lt;/p&gt;
+
+&lt;p&gt;The starting point was to simply use a stubbing framework for testing to stub out any methods that make a call to a remote service:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-ruby"&gt;Logplex.stub(:create_token)
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;This approach will gets tests passing, but couples your tests to the interface of the service handler, and prevents the handler itself from being exercised. What if handlers could be written that knew how to mock themselves?&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-ruby"&gt;Addons::Client.mock! if ENV[&amp;quot;RACK_ENV&amp;quot;] == &amp;quot;test&amp;quot;
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;This works pretty well for testing, but leaves it up to the developer to find themselves a working staging version of the remote service that won&amp;#39;t balk at being consumed by their development installation. This can work given a company-wide culture of well-documented and well-maintained staging environments, but even then, development can be slowed or blocked if a staging installation owned by another team breaks.&lt;/p&gt;
+
+&lt;p&gt;A possible next step is to build service handlers that will respond correctly in both development and testing environments:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-ruby"&gt;def detect_handler
+  return RealHandler.new if ENV.has_key?(&amp;quot;CORE_SHUSHU_URL&amp;quot;)
+  MockHandler.new
+end
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;Now we&amp;#39;re getting somewhere! Our mocks should behave reasonably during development and testing, and switch over to the real handler when the code hits staging or production.&lt;/p&gt;
+
+&lt;p&gt;While this kind of stub generally works pretty well, it still leaves us with a large disparity between development and production in that two different handlers, and therefore two completely different code paths are run in the two environments. A problem caused by this gap would hopefully be caught in a high-fidelity staging environment before making it to production, but even in staging, debugging is harder and slower compared to a local production copy.&lt;/p&gt;
+
+&lt;h2&gt;Rack Service Stubs&lt;/h2&gt;
+
+&lt;p&gt;While re-approaching the application code for our API, we started experimenting with doing away with the variety of stub handlers, and tried replacing them with actual implementations of the foreign stubs written with Rack-compliant libraries. These Rack stubs are designed to implement only the subset of the foreign API required by the calling app, and are greatly simplified to provide the bare minimum of the requirements for a correct response (and do little else).&lt;/p&gt;
+
+&lt;p&gt;Here&amp;#39;s an example Rack stub written for one of the API&amp;#39;s backend services in Sinatra:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-ruby"&gt;class IonStub &amp;lt; Sinatra::Base
+  post &amp;quot;/endpoints&amp;quot; do
+    status 201
+    content_type :json
+    MultiJson.encode({
+      id:           123,
+      cname:        &amp;quot;tokyo-1234.herokussl.com&amp;quot;,
+      elb_dns_name: &amp;quot;elb016353-1923944129.us-east-1.elb.amazonaws.com&amp;quot;,
+    })
+  end
+end
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;Because the stub is a fully functional application in its own right, it becomes immediately useful in both development and testing. A platform that trivializes deployment extends this use to cloud-hosted development and staging environments as well (i.e. you can &lt;code&gt;git push heroku master&lt;/code&gt; this stub and to make it available for other apps to talk to).&lt;/p&gt;
+
+&lt;h2&gt;Testing&lt;/h2&gt;
+
+&lt;p&gt;Use of service stubs in tests is made simple by using &lt;a href="https://github.com/bblimke/webmock"&gt;Webmock&amp;#39;s&lt;/a&gt; excellent Rack support to intercept requests made to a particular URL and send them off to be processed by the stub. Here are some examples of simple helper methods that we use in the API:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-ruby"&gt;# generic helper for use with any service
+def stub_service(uri, stub, &amp;amp;block)
+  uri = URI.parse(uri)
+  port = uri.port != uri.default_port ? &amp;quot;:#{uri.port}&amp;quot; : &amp;quot;&amp;quot;
+  stub = block ? Sinatra.new(stub, &amp;amp;block) : stub
+  stub_request(:any, /^#{uri.scheme}:\/\/(.*:.*@)?#{uri.host}#{port}\/.*$/).
+    to_rack(stub)
+end
+
+# One-liners specifically for a specific stubs, pointing to configured
+# locations of each remote service. A configuration value might look like:
+#
+#    ADDONS_URL=https://api-user:api-pass@addons.heroku.com
+#
+
+def stub_addons
+  stub_service(ENV[&amp;quot;ADDONS_URL&amp;quot;], AddonsStub, &amp;amp;block)
+end
+
+def stub_ion(&amp;amp;block)
+  stub_service(ENV[&amp;quot;ION_URL&amp;quot;], IonStub, &amp;amp;block)
+end
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;Now a stub can be initialized in a test and a remote service call made:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-ruby"&gt;it &amp;quot;should make a call to ion&amp;quot; do
+  stub_ion
+  endpoint = IonAPI.create_endpoint!
+end
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;This is particularly useful for tests that aim to exercise as many levels of application code as possible by stubbing at the level of HTTP calls rather than at a local service library, and ensuring that we&amp;#39;re running as much production code as we can.&lt;/p&gt;
+
+&lt;p&gt;Error conditions from the remote service can be tested by extending stubs with Sinatra&amp;#39;s widely-known DSL for particular test cases:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-ruby"&gt;it &amp;quot;should raise an error on a bad ion response&amp;quot; do
+  stub_ion do
+    post(&amp;quot;/endpoints&amp;quot;) { 422 }
+  end
+  lambda do
+    IonAPI.create_endpoint!
+  end.should raise_error(IonAPI::Error)
+end
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;h2&gt;Development&lt;/h2&gt;
+
+&lt;p&gt;By including a small snippet of conditional run code along with each stub, we ensure that each can be booted as an application in its own right:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-ruby"&gt;class IonStub &amp;lt; Sinatra::Base
+  ..
+end
+
+if __FILE__ == $0
+  $stdout.sync = $stderr.sync = true
+  IonStub.run! port: 5100
+end
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;Sinatra will boot such a stub by simply invoking its filename:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-bash"&gt;$ ruby test/test_support/service_stubs/ion_stub.rb
+&amp;gt;&amp;gt; Listening on 0.0.0.0:5100, CTRL+C to stop
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;Locally exporting an environmental variable ensures that the main app points to a booted stub in its development context:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code&gt;ION_URL=http://localhost:5100
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;With the stub running and the proper configuration in place, the main app can be booted (in this example, the Heroku API):&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-bash"&gt;$ bundle exec puma --quiet --threads 8:32 --port 5000 config.ru
+listening on addr=0.0.0.0:5000 fd=13
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;Requests to the app will call into the running service stub, allowing us to go a long way towards simulating a working service cloud with minimal setup required. In the example above, we&amp;#39;ve stubbed the API&amp;#39;s infrastructure service, so we can pretend to provision an &lt;code&gt;ssl:endpoint&lt;/code&gt;:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class="language-bash"&gt;$ export HEROKU_HOST=http://localhost:5000
+$ heroku addons:add ssl:endpoint
+$ heroku certs:add secure.example.org.pem secure.example.org.key
+Adding SSL Endpoint to great-cloud... done
+WARNING: ssl_cert provides no domain(s) that are configured for this Heroku app
+great-cloud now served by tokyo-1234.herokussl.com
+Certificate details:
+Common Name(s): alt1.example.org
+                alt2.example.org
+                secure.example.org
+
+Expires At:     2031-05-05 19:05 UTC
+Issuer:         /C=US/ST=California/L=San Francisco/O=Heroku/CN=secure.example.org
+Starts At:      2011-05-10 19:05 UTC
+Subject:        /C=US/ST=California/L=San Francisco/O=Heroku/CN=secure.example.org
+SSL certificate is self signed.
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;h3&gt;Foreman&lt;/h3&gt;
+
+&lt;p&gt;The process can be further streamlined by using &lt;a href="https://github.com/ddollar/foreman"&gt;Foreman&lt;/a&gt; and adding stubs to the list of processes that should be started:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code&gt;web:     bundle exec puma --quiet --threads 8:32 --port 5000 config.ru
+
+# stubs
+ionstub: bundle exec ruby service_stubs/ion_stub.rb
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;Put configuration in a place where Foreman can find it, like a local &lt;code&gt;.env&lt;/code&gt;:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code&gt;ION_URL=http://localhost:5100
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;With stub processes in place, issuing a &lt;code&gt;foreman start&lt;/code&gt; results in something like the following:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code&gt;18:18:22 web.1              | listening on addr=0.0.0.0:5000 fd=13
+18:18:22 ionstub.1          | == Sinatra/1.3.5 has taken the stage on 5100 for development with backup from WEBrick
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;That convenience further compounds with the more service stubs that are added. Here&amp;#39;s a sample of the boot process of the Heroku API:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code&gt;18:20:38 web.1              | listening on addr=0.0.0.0:5000 fd=13
+18:20:38 addonsstub.1       | == Sinatra/1.3.5 has taken the stage on 4101 for development with backup from WEBrick
+18:20:38 apollostub.1       | == Sinatra/1.3.5 has taken the stage on 4111 for development with backup from WEBrick
+18:20:38 eventmanagerstub.1 | == Sinatra/1.3.5 has taken the stage on 4102 for development with backup from WEBrick
+18:20:38 ionstub.1          | == Sinatra/1.3.5 has taken the stage on 4103 for development with backup from WEBrick
+18:20:38 paymentsstub.1     | == Sinatra/1.3.5 has taken the stage on 4109 for development with backup from WEBrick
+18:20:38 psmgrstub.1        | == Sinatra/1.3.5 has taken the stage on 4107 for development with backup from WEBrick
+18:20:38 maestrostub.1      | == Sinatra/1.3.5 has taken the stage on 4105 for development with backup from WEBrick
+18:20:38 yobukostub.1       | == Sinatra/1.3.5 has taken the stage on 4114 for development with backup from WEBrick
+18:20:38 logplexstub.1      | == Sinatra/1.3.5 has taken the stage on 4104 for development with backup from WEBrick
+18:20:38 vaultstub.1        | == Sinatra/1.3.5 has taken the stage on 4112 for development with backup from WEBrick
+18:20:38 vaultusagestub.1   | == Sinatra/1.3.5 has taken the stage on 4113 for development with backup from WEBrick
+18:20:38 zendeskssostub.1   | == Sinatra/1.3.5 has taken the stage on 4115 for development with backup from WEBrick
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;A working example of this project is available at &lt;a href="https://github.com/brandur/service-stub-example"&gt;brandur/service-stub-example&lt;/a&gt;.&lt;/p&gt;
+</content>
+    <published>2013-05-23T19:16:28+00:00</published>
+    <updated>2013-05-23T19:16:28+00:00</updated>
+    <link href="https://brandur.github.io/heroku-api-blog/service-stubs"/>
+    <id>tag:brandur.github.io/heroku-api-blog,2013-05-23:/service-stubs</id>
+  </entry>
+</feed>
